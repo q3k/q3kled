@@ -1,164 +1,158 @@
 #include <linux/module.h>
-#include <linux/dma-mapping.h>
-#include <linux/slab.h>
-#include <linux/dmaengine.h>
 #include <linux/of_platform.h>
-#include <linux/platform_device.h>
-#include <linux/amba/xilinx_dma.h>
-#include <linux/kthread.h>
-#include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/fb.h>
 
-#define LED_DRIVER "xilinx-dma"
-#define LED_DEVICE_ID 0
+struct q3kled_device {
+    void __iomem *mem;
+    struct device *dev;
+    struct fb_info info;
+    u32 pseudo_palette[16];
+};
 
-#define LED_XRES 128
-#define LED_YRES 128
-#define BUFFER_SIZE (LED_XRES * LED_YRES * 4)
-
-static bool led_dma_filter(struct dma_chan *chan, void *param)
+static int q3kled_remove(struct platform_device *pdev)
 {
-    struct device *dma_dev, *chan_dev;
-    struct device_node *dma_node, *iter_node;
-    int err, channel_count = 0;
-    uint32_t device_id;
-    bool device_id_valid = false;
-
-    dma_dev = chan->device->dev;
-    if (strncmp(dma_dev->driver->name, LED_DRIVER, strlen(LED_DRIVER)) != 0) {
-        return false;
-    }
-    chan_dev = &chan->dev->device;
-    if (chan_dev == NULL) {
-        return false;
-    }
-
-    // We're looking for a DMA device with a single channel (the one we're
-    // iterating over).
-    dma_node = dma_dev->of_node;
-    if (dma_node == NULL) {
-        return false;
-    }
-    for_each_child_of_node(dma_node, iter_node) {
-        channel_count++;
-        err = of_property_read_u32(iter_node, "xlnx,device-id", &device_id);
-        if (!err) {
-            device_id_valid = true;
-        }
-    }
-    if (channel_count != 1 || !device_id_valid) {
-        return false;
-    }
-
-    if (device_id == LED_DEVICE_ID) {
-        printk(KERN_INFO "q3kled: found dma channel dma%uchan%u\n", chan->dev->dev_id, chan->chan_id);
-        return true;
-    }
-   
-    return false;
-}
-
-static char *tx_buffer = NULL;
-static uint32_t tx_buffer_phy;
-static dma_cookie_t tx_cookie;
-
-static void init_buffer(void)
-{
-    int x, y;
-    for (x = 0; x < LED_XRES; x++) {
-        for (y = 0; y < LED_YRES; y++) {
-            tx_buffer[y*LED_YRES*4 + x*4] = x ^ y;
-        }
-    }
-}
-
-static void axidma_sync_callback(void *completion)
-{
-    printk(KERN_INFO "q3kled: sent!\n");
-}
-
-struct dma_chan *tx_chan = NULL;
-struct dma_async_tx_descriptor *chan_desc = NULL;
-
-static int transmit(void *data)
-{
-    while (!kthread_should_stop()) {
-        struct dma_async_tx_descriptor *chan_desc;
-        uint32_t buf_size = BUFFER_SIZE;
-        enum dma_ctrl_flags flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
-
-        chan_desc = dmaengine_prep_slave_single(tx_chan, tx_buffer_phy, buf_size, DMA_DEV_TO_MEM, flags);
-        if (!chan_desc) {
-            printk(KERN_ERR "q3kled: dmaengine_prep_slave_single error\n");
-            return -EBUSY;
-        }
-
-        chan_desc->callback = axidma_sync_callback;
-        tx_cookie = dmaengine_submit(chan_desc);
-        if (dma_submit_error(tx_cookie)) {
-            printk(KERN_ERR "q3kled: submit error\n");
-            return -EBUSY;
-        }
-
-        dma_async_issue_pending(tx_chan);
-        printk(KERN_INFO "q3kled: issued\n");
-        dma_wait_for_async_tx(chan_desc);
-        printk(KERN_INFO "q3kled: waited\n");
-        msleep(1000);
-
-    }
-    printk("q3kled: stopping worker\n");
+    struct q3kled_device *qdev = platform_get_drvdata(pdev);
+    unregister_framebuffer(&qdev->info);
     return 0;
 }
 
-struct task_struct *task = NULL;
-
-static int __init led_init(void)
+static int q3kled_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
+        u_int transp, struct fb_info *info)
 {
-    dma_cap_mask_t mask;
+    u32 *pal = info->pseudo_palette;
+    u32 cr = red >> (16 - info->var.red.length);
+    u32 cg = green >> (16 - info->var.green.length);
+    u32 cb = blue >> (16 - info->var.blue.length);
+    u32 value;
 
-    dma_cap_zero(mask);
-    dma_cap_set(DMA_SLAVE | DMA_PRIVATE, mask);
+    if (regno >= 16)
+        return -EINVAL;
 
-    tx_chan = dma_request_channel(mask, led_dma_filter, NULL);
-    if (tx_chan == NULL) {
-        pr_err("q3kled: could not allocate TX channel\n");
-        return -ENODEV;
+    value = (cr << info->var.red.offset) |
+        (cg << info->var.green.offset) |
+        (cb << info->var.blue.offset);
+    if (info->var.transp.length > 0) {
+        u32 mask = (1 << info->var.transp.length) - 1;
+        mask <<= info->var.transp.offset;
+        value |= mask;
     }
+    pal[regno] = value;
 
-    tx_buffer = dma_alloc_coherent(tx_chan->device->dev, PAGE_ALIGN(BUFFER_SIZE), &tx_buffer_phy, GFP_KERNEL);
-    if (tx_buffer == NULL) {
-        pr_err("q3kled: could not allocate TX memory\n");
-        dma_release_channel(tx_chan);
-        tx_chan = NULL;
+    return 0;
+}
+
+static struct fb_ops q3kled_ops = {
+    .owner = THIS_MODULE,
+    .fb_setcolreg = q3kled_setcolreg,
+    .fb_fillrect = sys_fillrect,
+    .fb_copyarea = sys_copyarea,
+    .fb_imageblit = sys_imageblit
+};
+
+static int q3kled_probe(struct platform_device *pdev)
+{
+    struct q3kled_device *qdev;
+    struct fb_var_screeninfo *var;
+    struct fb_fix_screeninfo *fix;
+    struct resource *res;
+    unsigned long long i;
+    int ret;
+
+    qdev = devm_kzalloc(&pdev->dev, sizeof(*qdev), GFP_KERNEL);
+    if (!qdev)
         return -ENOMEM;
-    }
-    printk(KERN_INFO "q3kled: buffer @ %08x/%08x\n", tx_buffer, tx_buffer_phy);
+    qdev->dev = &(pdev->dev);
 
-    init_buffer();
-    smp_wmb();
-    
-    task = kthread_run(transmit, NULL, "xD");
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    qdev->mem = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(qdev->mem))
+        return PTR_ERR(qdev->mem);
+
+    platform_set_drvdata(pdev, qdev);
+
+    qdev->info.fbops = &q3kled_ops;
+    qdev->info.device = &pdev->dev;
+    qdev->info.par = qdev;
+
+    var = &qdev->info.var;
+    fix = &qdev->info.fix;
+
+    var->accel_flags = FB_ACCEL_NONE;
+    var->activate = FB_ACTIVATE_NOW;
+    var->xres = 128;
+    var->yres = 128;
+    var->xres_virtual = var->xres;
+    var->yres_virtual = var->yres;
+    var->bits_per_pixel = 32;
+    var->pixclock = KHZ2PICOS(51200);
+    var->vmode = FB_VMODE_NONINTERLACED;
+        
+    var->transp.offset = 24;
+    var->transp.length = 8;
+    var->red.offset = 16;
+    var->red.length = 8;
+    var->green.offset = 8;
+    var->green.length = 8;
+    var->blue.offset = 0;
+    var->blue.length = 8;
+
+    var->hsync_len = 1;
+    var->left_margin = 1;
+    var->right_margin = 1;
+    var->vsync_len = 1;
+    var->upper_margin = 1;
+    var->lower_margin = 1;
+
+    strcpy(fix->id, "q3kled-fb");
+    fix->line_length = var->xres * (var->bits_per_pixel/8);
+    fix->smem_len = fix->line_length * var->yres;
+    fix->type = FB_TYPE_PACKED_PIXELS;
+    fix->visual = FB_VISUAL_TRUECOLOR;
+
+    fix->smem_start = res->start;
+    qdev->info.screen_base = qdev->mem;
+    qdev->info.pseudo_palette = qdev->pseudo_palette;
+
+    dev_info(&pdev->dev, "led virt=%p phys=%x size=%d\n",
+                    qdev->mem, res->start, fix->smem_len);
+
+
+    for (i = 0; i < 128*128; i++) {
+        iowrite32(0x0, qdev->mem + i*4);
+    }
+
+    ret = fb_alloc_cmap(&qdev->info.cmap, 256, 0);
+    if (ret) {
+        dev_err(&pdev->dev, "fb_alloc_cmap failed\n");
+        return ret;
+    }
+
+    ret = register_framebuffer(&qdev->info);
+    if (ret) {
+        dev_err(&pdev->dev, "Framebuffer registration failed\n");
+        return ret;
+    }
+
+
+    dev_info(&pdev->dev, "All good! %08x\n", ioread32(qdev->mem));
     return 0;
 }
 
-static void __exit led_exit(void)
-{
-    enum dma_status status;
-    struct dma_tx_state state;
+static const struct of_device_id q3kled_of_match[] = {
+    { .compatible = "xlnx,ledcontroller-1.0",},
+    {}
+};
+MODULE_DEVICE_TABLE(of, q3kled_of_match);
 
-    if (task) {
-        kthread_stop(task);
-    }
-    if (tx_chan) {
-        status = dmaengine_tx_status(tx_chan, tx_cookie, &state);
-        printk(KERN_INFO "q3kled: unload status %i\n", status);
-        dma_release_channel(tx_chan);
-    }
-    if (tx_buffer) {
-        dma_free_coherent(tx_chan->device->dev, PAGE_ALIGN(BUFFER_SIZE), tx_buffer, tx_buffer_phy);
-    }
-}
+static struct platform_driver q3kled_driver = {
+    .driver = {
+        .name = "ledcontroller",
+        .of_match_table = q3kled_of_match,
+    },
+    .probe = q3kled_probe,
+    .remove = q3kled_remove,
+};
+module_platform_driver(q3kled_driver);
 
-module_init(led_init);
-module_exit(led_exit);
 MODULE_LICENSE("Dual BSD/GPL");
